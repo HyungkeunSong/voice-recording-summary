@@ -69,12 +69,19 @@ export async function POST(request: NextRequest) {
     let wavBuffer: Buffer;
     try {
       wavBuffer = convertToWav(inputBuffer);
-    } catch (ffmpegError) {
-      console.error("ffmpeg conversion error:", ffmpegError);
+    } catch (ffmpegError: unknown) {
+      const errMsg = ffmpegError instanceof Error ? ffmpegError.message : String(ffmpegError);
+      const errStack = ffmpegError instanceof Error ? ffmpegError.stack : undefined;
+      console.error("ffmpeg conversion error:", errMsg, errStack);
       return NextResponse.json(
         {
-          error: "오디오 파일을 변환할 수 없습니다. 다른 녹음 파일로 시도해주세요.",
-          debug: { originalName: file.name, type: file.type, size: file.size },
+          error: `오디오 파일을 변환할 수 없습니다.`,
+          debug: {
+            originalName: file.name,
+            type: file.type,
+            size: file.size,
+            ffmpegError: errMsg,
+          },
         },
         { status: 422 }
       );

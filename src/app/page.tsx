@@ -65,7 +65,8 @@ export default function Home() {
 
       if (!response.ok) {
         const data = await response.json();
-        const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}` : "";
+        const ffmpegInfo = data.debug?.ffmpegError ? `\n[ffmpeg] ${data.debug.ffmpegError}` : "";
+        const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}${ffmpegInfo}` : "";
         throw new Error((data.error || "처리 중 오류가 발생했습니다.") + debugInfo);
       }
 
