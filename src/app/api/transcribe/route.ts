@@ -9,6 +9,8 @@ function getOpenAI() {
 }
 
 const MAX_SIZE = 25 * 1024 * 1024; // 25MB
+const WHISPER_LIMIT = 20 * 1024 * 1024; // 20MB per chunk (safe margin under 25MB API limit)
+const WAV_HEADER_SIZE = 44;
 
 function isAmrFile(buffer: Buffer): boolean {
   return buffer.length >= 6 && buffer.toString("ascii", 0, 6) === "#!AMR\n";
@@ -31,6 +33,77 @@ function convertAmrToWav(amrBuffer: Buffer): Buffer {
   }
   return Buffer.from(wavData);
 }
+
+/**
+ * Splits a WAV buffer into multiple chunks, each with a valid WAV header.
+ * Assumes PCM format (no compression). Each chunk is ≤ maxChunkSize bytes.
+ */
+function splitWavIntoChunks(wavBuffer: Buffer, maxChunkSize: number): Buffer[] {
+  if (wavBuffer.length <= maxChunkSize) {
+    return [wavBuffer];
+  }
+
+  // Read WAV header info
+  const numChannels = wavBuffer.readUInt16LE(22);
+  const sampleRate = wavBuffer.readUInt32LE(24);
+  const bitsPerSample = wavBuffer.readUInt16LE(34);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+
+  const pcmData = wavBuffer.subarray(WAV_HEADER_SIZE);
+  const maxPcmPerChunk = Math.floor((maxChunkSize - WAV_HEADER_SIZE) / blockAlign) * blockAlign;
+
+  const chunks: Buffer[] = [];
+  let offset = 0;
+
+  while (offset < pcmData.length) {
+    const chunkPcmSize = Math.min(maxPcmPerChunk, pcmData.length - offset);
+    const chunkPcm = pcmData.subarray(offset, offset + chunkPcmSize);
+
+    // Build a new WAV header for this chunk
+    const header = Buffer.alloc(WAV_HEADER_SIZE);
+    const fileSize = WAV_HEADER_SIZE + chunkPcmSize;
+    header.write("RIFF", 0);
+    header.writeUInt32LE(fileSize - 8, 4);       // ChunkSize
+    header.write("WAVE", 8);
+    header.write("fmt ", 12);
+    header.writeUInt32LE(16, 16);                 // Subchunk1Size (PCM)
+    header.writeUInt16LE(1, 20);                  // AudioFormat (PCM=1)
+    header.writeUInt16LE(numChannels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(sampleRate * blockAlign, 28); // ByteRate
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write("data", 36);
+    header.writeUInt32LE(chunkPcmSize, 40);       // Subchunk2Size
+
+    chunks.push(Buffer.concat([header, chunkPcm]));
+    offset += chunkPcmSize;
+  }
+
+  return chunks;
+}
+
+/**
+ * Transcribes a single audio buffer via Whisper API.
+ */
+async function transcribeBuffer(
+  openai: OpenAI,
+  buffer: Buffer,
+  name: string,
+  type: string
+): Promise<string> {
+  const uploadFile = await toFile(buffer, name, { type });
+  const transcription = await openai.audio.transcriptions.create({
+    file: uploadFile,
+    model: "whisper-1",
+    language: "ko",
+    response_format: "text",
+  });
+  return transcription as unknown as string;
+}
+
+// Vercel serverless max duration — 60s on Hobby, up to 300s on Pro
+export const maxDuration = 60;
 
 export async function POST(request: NextRequest) {
   let file: File | null = null;
@@ -126,17 +199,28 @@ export async function POST(request: NextRequest) {
       uploadType = MIME_MAP[ext] || "audio/mpeg";
     }
 
-    // Whisper API
-    const uploadFile = await toFile(uploadBuffer, uploadName, { type: uploadType });
+    // Whisper API — split large WAV files into chunks
     const openai = getOpenAI();
-    const transcription = await openai.audio.transcriptions.create({
-      file: uploadFile,
-      model: "whisper-1",
-      language: "ko",
-      response_format: "text",
-    });
+    let transcript: string;
 
-    const transcript = transcription as unknown as string;
+    if (uploadType === "audio/wav" && uploadBuffer.length > WHISPER_LIMIT) {
+      // WAV too large for single Whisper call → split into chunks and transcribe in parallel
+      const chunks = splitWavIntoChunks(uploadBuffer, WHISPER_LIMIT);
+      console.log(`[DEBUG] WAV too large (${(uploadBuffer.length / 1024 / 1024).toFixed(1)}MB), split into ${chunks.length} chunks`);
+
+      const promises = chunks.map((chunk, i) => {
+        console.log(`[DEBUG] Transcribing chunk ${i + 1}/${chunks.length} (${(chunk.length / 1024 / 1024).toFixed(1)}MB)`);
+        return transcribeBuffer(openai, chunk, `audio_${i}.wav`, "audio/wav");
+      });
+
+      const results = await Promise.all(promises);
+      transcript = results
+        .map((r) => (r ? r.trim() : ""))
+        .filter((r) => r.length > 0)
+        .join(" ");
+    } else {
+      transcript = await transcribeBuffer(openai, uploadBuffer, uploadName, uploadType);
+    }
 
     if (!transcript || transcript.trim().length === 0) {
       return NextResponse.json(
