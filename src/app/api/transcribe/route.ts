@@ -13,6 +13,11 @@ function isAmrFile(buffer: Buffer): boolean {
   return buffer.length >= 6 && buffer.toString("ascii", 0, 6) === "#!AMR\n";
 }
 
+function isMp4Container(buffer: Buffer): boolean {
+  // MP4/M4A/3GP 등 ISO Base Media 형식: offset 4-7이 "ftyp"
+  return buffer.length >= 8 && buffer.toString("ascii", 4, 8) === "ftyp";
+}
+
 function convertAmrToWav(amrBuffer: Buffer): Buffer {
   // amr-js/library/amrnb.js: 순수 JS(asm.js) AMR-NB 디코더
   // AMR.toWAV(Uint8Array) → Uint8Array (WAV 8kHz 16bit mono)
@@ -77,10 +82,16 @@ export async function POST(request: NextRequest) {
           { status: 422 }
         );
       }
+    } else if (isMp4Container(inputBuffer)) {
+      // 3GP/3G2/M4A 등 MP4 계열: .mp4 확장자로 통일하면 Whisper가 인식
+      console.log("[DEBUG] MP4/ftyp container detected, sending as .mp4");
+      uploadBuffer = inputBuffer;
+      uploadName = "audio.mp4";
+      uploadType = "audio/mp4";
     } else {
-      // 비 AMR 파일: 확장자 기반 MIME 매핑 후 그대로 전달
+      // 기타 파일: 확장자 기반 MIME 매핑 후 그대로 전달
       const fileName = file.name.toLowerCase();
-      const ext = fileName.match(/\.(m4a|mp3|aac|wav|ogg|webm|flac|mp4|mpeg|mpga|oga)$/)?.[1] || "m4a";
+      const ext = fileName.match(/\.(m4a|mp3|aac|wav|ogg|webm|flac|mp4|mpeg|mpga|oga)$/)?.[1] || "mp3";
       const MIME_MAP: Record<string, string> = {
         m4a: "audio/mp4", mp3: "audio/mpeg", aac: "audio/aac",
         wav: "audio/wav", ogg: "audio/ogg", webm: "audio/webm", flac: "audio/flac",
@@ -88,7 +99,7 @@ export async function POST(request: NextRequest) {
       };
       uploadBuffer = inputBuffer;
       uploadName = `audio.${ext}`;
-      uploadType = MIME_MAP[ext] || "audio/mp4";
+      uploadType = MIME_MAP[ext] || "audio/mpeg";
     }
 
     // Whisper API
