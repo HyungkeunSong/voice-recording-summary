@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
+import { extract3gpAmrData } from "@/app/utils/extract3gpAmr";
 
 function getOpenAI() {
   return new OpenAI({
@@ -83,11 +84,34 @@ export async function POST(request: NextRequest) {
         );
       }
     } else if (isMp4Container(inputBuffer)) {
-      // 3GP/3G2/M4A 등 MP4 계열: .mp4 확장자로 통일하면 Whisper가 인식
-      console.log("[DEBUG] MP4/ftyp container detected, sending as .mp4");
-      uploadBuffer = inputBuffer;
-      uploadName = "audio.mp4";
-      uploadType = "audio/mp4";
+      // 3GP/3G2 with AMR-NB audio: extract raw AMR frames from the mdat box,
+      // prepend "#!AMR\n", then decode to WAV with amr-js.
+      // Falls back to forwarding the raw container if AMR extraction fails.
+      console.log("[DEBUG] MP4/ftyp container detected");
+      const is3gp = inputBuffer.toString("ascii", 8, 12).startsWith("3gp");
+      if (is3gp) {
+        console.log("[DEBUG] 3GP brand detected, extracting AMR from mdat...");
+        try {
+          const amrBuffer = extract3gpAmrData(inputBuffer);
+          console.log(`[DEBUG] AMR extracted (${amrBuffer.length} bytes), converting to WAV...`);
+          uploadBuffer = convertAmrToWav(amrBuffer);
+          uploadName = "audio.wav";
+          uploadType = "audio/wav";
+          console.log(`[DEBUG] WAV conversion done, size: ${uploadBuffer.length}`);
+        } catch (extractError: unknown) {
+          // Fallback: send the container directly to Whisper
+          const msg = extractError instanceof Error ? extractError.message : String(extractError);
+          console.warn(`[DEBUG] AMR extraction failed (${msg}), falling back to .mp4 upload`);
+          uploadBuffer = inputBuffer;
+          uploadName = "audio.mp4";
+          uploadType = "audio/mp4";
+        }
+      } else {
+        console.log("[DEBUG] Non-3GP MP4 container, sending as .mp4");
+        uploadBuffer = inputBuffer;
+        uploadName = "audio.mp4";
+        uploadType = "audio/mp4";
+      }
     } else {
       // 기타 파일: 확장자 기반 MIME 매핑 후 그대로 전달
       const fileName = file.name.toLowerCase();
