@@ -58,17 +58,32 @@ export default function Home() {
 
       setStep("transcribing");
 
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 2분 타임아웃
+
       const response = await fetch("/api/transcribe", {
         method: "POST",
         body: formData,
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
-        const data = await response.json();
-        const extraInfo = data.debug?.ffmpegError ? `\n[ffmpeg] ${data.debug.ffmpegError}` : (data.debug?.amrError ? `\n[amr] ${data.debug.amrError}` : "");
-        const magicInfo = data.debug?.magic ? `\n[magic] ${data.debug.magic}` : "";
-        const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}${extraInfo}${magicInfo}` : "";
-        throw new Error((data.error || "처리 중 오류가 발생했습니다.") + debugInfo);
+        let errorMsg = "처리 중 오류가 발생했습니다.";
+        try {
+          const data = await response.json();
+          const extraInfo = data.debug?.ffmpegError ? `\n[ffmpeg] ${data.debug.ffmpegError}` : (data.debug?.amrError ? `\n[amr] ${data.debug.amrError}` : "");
+          const magicInfo = data.debug?.magic ? `\n[magic] ${data.debug.magic}` : "";
+          const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}${extraInfo}${magicInfo}` : "";
+          errorMsg = (data.error || errorMsg) + debugInfo;
+        } catch {
+          if (response.status === 504) {
+            errorMsg = "서버 처리 시간이 초과되었습니다. 파일이 너무 길 수 있습니다.";
+          } else {
+            errorMsg = `서버 오류 (${response.status}). 잠시 후 다시 시도해주세요.`;
+          }
+        }
+        throw new Error(errorMsg);
       }
 
       setStep("summarizing");
@@ -76,7 +91,12 @@ export default function Home() {
       setResult(data);
       setStep("done");
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
+      let message: string;
+      if (err instanceof DOMException && err.name === "AbortError") {
+        message = "처리 시간이 초과되었습니다. 파일이 너무 길 수 있습니다.";
+      } else {
+        message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
+      }
       setError(message);
       setStep("error");
     }
