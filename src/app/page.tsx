@@ -65,8 +65,9 @@ export default function Home() {
 
       if (!response.ok) {
         const data = await response.json();
-        const ffmpegInfo = data.debug?.ffmpegError ? `\n[ffmpeg] ${data.debug.ffmpegError}` : "";
-        const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}${ffmpegInfo}` : "";
+        const extraInfo = data.debug?.ffmpegError ? `\n[ffmpeg] ${data.debug.ffmpegError}` : (data.debug?.amrError ? `\n[amr] ${data.debug.amrError}` : "");
+        const magicInfo = data.debug?.magic ? `\n[magic] ${data.debug.magic}` : "";
+        const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}${extraInfo}${magicInfo}` : "";
         throw new Error((data.error || "처리 중 오류가 발생했습니다.") + debugInfo);
       }
 

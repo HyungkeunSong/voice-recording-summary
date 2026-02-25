@@ -28,6 +28,7 @@ function convertAmrToWav(amrBuffer: Buffer): Buffer {
 
 export async function POST(request: NextRequest) {
   let file: File | null = null;
+  let magicHex = "";
   try {
     const formData = await request.formData();
     file = formData.get("file") as File | null;
@@ -49,8 +50,10 @@ export async function POST(request: NextRequest) {
     console.log(`[DEBUG] original name: ${file.name}, type: ${file.type}, size: ${file.size}`);
 
     const inputBuffer = Buffer.from(await file.arrayBuffer());
-    const first8hex = inputBuffer.subarray(0, 8).toString("hex");
-    console.log(`[DEBUG] magic bytes: ${first8hex}`);
+    magicHex = inputBuffer.subarray(0, 16).toString("hex");
+    const magicAscii = inputBuffer.subarray(0, 16).toString("ascii").replace(/[^\x20-\x7E]/g, ".");
+    console.log(`[DEBUG] magic hex: ${magicHex}`);
+    console.log(`[DEBUG] magic ascii: ${magicAscii}`);
 
     let uploadBuffer: Buffer;
     let uploadName: string;
@@ -163,7 +166,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           error: `OpenAI API 오류: ${error.message}`,
-          debug: { originalName: file?.name, type: file?.type, size: file?.size },
+          debug: { originalName: file?.name, type: file?.type, size: file?.size, magic: magicHex },
         },
         { status: 502 }
       );
