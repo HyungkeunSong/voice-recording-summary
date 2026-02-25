@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+function getOpenAI() {
+  return new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+}
 
 const ALLOWED_TYPES = [
   "audio/mpeg",
@@ -63,6 +65,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Step 1: Whisper API로 음성 → 텍스트
+    const openai = getOpenAI();
     const transcription = await openai.audio.transcriptions.create({
       file: file,
       model: "whisper-1",
