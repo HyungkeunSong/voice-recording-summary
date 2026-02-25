@@ -69,8 +69,14 @@ export async function POST(request: NextRequest) {
     // 카카오톡 등에서 저장한 파일은 MIME type이나 파일명이 깨질 수 있으므로
     // Buffer로 변환 후 깨끗한 파일명으로 OpenAI에 전달
     const ext = fileName.match(/\.(m4a|mp3|aac|amr|wav|ogg|webm|flac|mp4|mpeg|mpga|oga)$/)?.[1] || "m4a";
+    const MIME_MAP: Record<string, string> = {
+      m4a: "audio/mp4", mp3: "audio/mpeg", aac: "audio/aac", amr: "audio/amr",
+      wav: "audio/wav", ogg: "audio/ogg", webm: "audio/webm", flac: "audio/flac",
+      mp4: "audio/mp4", mpeg: "audio/mpeg", mpga: "audio/mpeg", oga: "audio/ogg",
+    };
+    const contentType = MIME_MAP[ext] || "audio/mp4";
     const buffer = Buffer.from(await file.arrayBuffer());
-    const uploadFile = await toFile(buffer, `audio.${ext}`);
+    const uploadFile = await toFile(buffer, `audio.${ext}`, { type: contentType });
 
     console.log(`[DEBUG] original name: ${file.name}, type: ${file.type}, size: ${file.size}, ext: ${ext}`);
 
