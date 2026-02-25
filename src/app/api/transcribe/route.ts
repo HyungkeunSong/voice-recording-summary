@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
+import { execFileSync } from "child_process";
+import { writeFileSync, readFileSync, unlinkSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
 
 function getOpenAI() {
   return new OpenAI({
@@ -7,23 +12,35 @@ function getOpenAI() {
   });
 }
 
-const ALLOWED_TYPES = [
-  "audio/mpeg",
-  "audio/mp3",
-  "audio/mp4",
-  "audio/m4a",
-  "audio/x-m4a",
-  "audio/aac",
-  "audio/amr",
-  "audio/wav",
-  "audio/x-wav",
-  "audio/ogg",
-  "audio/webm",
-  "video/webm",
-  "audio/flac",
-];
+// ffmpeg-static 경로를 동적으로 가져옴
+function getFfmpegPath(): string {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require("ffmpeg-static") as string;
+}
 
 const MAX_SIZE = 25 * 1024 * 1024; // 25MB
+
+function convertToWav(inputBuffer: Buffer): Buffer {
+  const id = randomUUID();
+  const inputPath = join(tmpdir(), `${id}-input`);
+  const outputPath = join(tmpdir(), `${id}-output.wav`);
+
+  try {
+    writeFileSync(inputPath, inputBuffer);
+    execFileSync(getFfmpegPath(), [
+      "-i", inputPath,
+      "-ar", "16000",
+      "-ac", "1",
+      "-f", "wav",
+      "-y",
+      outputPath,
+    ], { timeout: 60000 });
+    return readFileSync(outputPath);
+  } finally {
+    try { unlinkSync(inputPath); } catch { /* ignore */ }
+    try { unlinkSync(outputPath); } catch { /* ignore */ }
+  }
+}
 
 export async function POST(request: NextRequest) {
   let file: File | null = null;
@@ -45,41 +62,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 파일 확장자로도 체크 (모바일에서 MIME type이 부정확할 수 있음)
-    const fileName = file.name.toLowerCase();
-    const validExtensions = [
-      ".m4a", ".mp3", ".aac", ".amr", ".wav", ".ogg", ".webm", ".flac", ".mp4",
-    ];
-    const hasValidExtension = validExtensions.some((ext) =>
-      fileName.endsWith(ext)
-    );
-    const hasValidType = ALLOWED_TYPES.includes(file.type);
+    console.log(`[DEBUG] original name: ${file.name}, type: ${file.type}, size: ${file.size}`);
 
-    if (!hasValidExtension && !hasValidType) {
+    // Step 1: ffmpeg로 WAV 변환 (어떤 형식이든 처리 가능)
+    const inputBuffer = Buffer.from(await file.arrayBuffer());
+    let wavBuffer: Buffer;
+    try {
+      wavBuffer = convertToWav(inputBuffer);
+    } catch (ffmpegError) {
+      console.error("ffmpeg conversion error:", ffmpegError);
       return NextResponse.json(
         {
-          error:
-            "지원하지 않는 파일 형식입니다. m4a, mp3, aac, amr, wav, ogg, webm 파일을 업로드해주세요.",
+          error: "오디오 파일을 변환할 수 없습니다. 다른 녹음 파일로 시도해주세요.",
+          debug: { originalName: file.name, type: file.type, size: file.size },
         },
-        { status: 400 }
+        { status: 422 }
       );
     }
 
-    // Step 1: Whisper API로 음성 → 텍스트
-    // 카카오톡 등에서 저장한 파일은 MIME type이나 파일명이 깨질 수 있으므로
-    // Buffer로 변환 후 깨끗한 파일명으로 OpenAI에 전달
-    const ext = fileName.match(/\.(m4a|mp3|aac|amr|wav|ogg|webm|flac|mp4|mpeg|mpga|oga)$/)?.[1] || "m4a";
-    const MIME_MAP: Record<string, string> = {
-      m4a: "audio/mp4", mp3: "audio/mpeg", aac: "audio/aac", amr: "audio/amr",
-      wav: "audio/wav", ogg: "audio/ogg", webm: "audio/webm", flac: "audio/flac",
-      mp4: "audio/mp4", mpeg: "audio/mpeg", mpga: "audio/mpeg", oga: "audio/ogg",
-    };
-    const contentType = MIME_MAP[ext] || "audio/mp4";
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const uploadFile = await toFile(buffer, `audio.${ext}`, { type: contentType });
-
-    console.log(`[DEBUG] original name: ${file.name}, type: ${file.type}, size: ${file.size}, ext: ${ext}`);
-
+    // Step 2: Whisper API로 음성 → 텍스트
+    const uploadFile = await toFile(wavBuffer, "audio.wav", { type: "audio/wav" });
     const openai = getOpenAI();
     const transcription = await openai.audio.transcriptions.create({
       file: uploadFile,
@@ -97,7 +99,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Step 2: GPT로 요약 생성
+    // Step 3: GPT로 요약 생성
     const summaryResponse = await openai.chat.completions.create({
       model: "gpt-5.2",
       messages: [
@@ -165,9 +167,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};

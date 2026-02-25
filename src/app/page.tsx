@@ -16,89 +16,16 @@ interface Result {
   summary: Summary;
 }
 
-type ProcessingStep = "idle" | "converting" | "uploading" | "transcribing" | "summarizing" | "done" | "error";
+type ProcessingStep = "idle" | "uploading" | "transcribing" | "summarizing" | "done" | "error";
 
 const STEP_LABELS: Record<ProcessingStep, string> = {
   idle: "",
-  converting: "오디오 파일 변환 중...",
   uploading: "파일 업로드 중...",
-  transcribing: "음성을 텍스트로 변환 중...",
+  transcribing: "음성 변환 및 텍스트 추출 중...",
   summarizing: "내용 분석 및 요약 중...",
   done: "완료!",
   error: "오류 발생",
 };
-
-async function convertToWav(file: File): Promise<File> {
-  const arrayBuffer = await file.arrayBuffer();
-  const audioContext = new AudioContext({ sampleRate: 16000 });
-
-  let audioBuffer: AudioBuffer;
-  try {
-    audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-  } catch {
-    // 브라우저가 디코딩 못하면 원본 그대로 반환
-    await audioContext.close();
-    return file;
-  }
-
-  // mono로 다운믹스
-  const numberOfChannels = 1;
-  const sampleRate = 16000;
-  const length = audioBuffer.length;
-
-  // 모든 채널을 평균해서 mono로
-  const monoData = new Float32Array(length);
-  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-    const channelData = audioBuffer.getChannelData(ch);
-    for (let i = 0; i < length; i++) {
-      monoData[i] += channelData[i] / audioBuffer.numberOfChannels;
-    }
-  }
-
-  // Float32 → Int16 PCM
-  const pcmData = new Int16Array(length);
-  for (let i = 0; i < length; i++) {
-    const s = Math.max(-1, Math.min(1, monoData[i]));
-    pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-  }
-
-  // WAV 헤더 생성
-  const wavBuffer = new ArrayBuffer(44 + pcmData.length * 2);
-  const view = new DataView(wavBuffer);
-
-  // RIFF header
-  writeString(view, 0, "RIFF");
-  view.setUint32(4, 36 + pcmData.length * 2, true);
-  writeString(view, 8, "WAVE");
-
-  // fmt chunk
-  writeString(view, 12, "fmt ");
-  view.setUint32(16, 16, true); // chunk size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, numberOfChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numberOfChannels * 2, true); // byte rate
-  view.setUint16(32, numberOfChannels * 2, true); // block align
-  view.setUint16(34, 16, true); // bits per sample
-
-  // data chunk
-  writeString(view, 36, "data");
-  view.setUint32(40, pcmData.length * 2, true);
-
-  // PCM data
-  const wavBytes = new Uint8Array(wavBuffer);
-  wavBytes.set(new Uint8Array(pcmData.buffer), 44);
-
-  await audioContext.close();
-
-  return new File([wavBuffer], "audio.wav", { type: "audio/wav" });
-}
-
-function writeString(view: DataView, offset: number, str: string) {
-  for (let i = 0; i < str.length; i++) {
-    view.setUint8(offset + i, str.charCodeAt(i));
-  }
-}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -123,16 +50,11 @@ export default function Home() {
 
     setError("");
     setResult(null);
+    setStep("uploading");
 
     try {
-      // Step 1: 브라우저에서 WAV로 변환
-      setStep("converting");
-      const wavFile = await convertToWav(file);
-
-      // Step 2: 업로드
-      setStep("uploading");
       const formData = new FormData();
-      formData.append("file", wavFile);
+      formData.append("file", file);
 
       setStep("transcribing");
 
@@ -192,7 +114,7 @@ ${summary.legallySignificant}
 ${summary.cautions}`;
   };
 
-  const isProcessing = step === "converting" || step === "uploading" || step === "transcribing" || step === "summarizing";
+  const isProcessing = step === "uploading" || step === "transcribing" || step === "summarizing";
 
   return (
     <main className="min-h-screen px-4 py-6 max-w-lg mx-auto">
