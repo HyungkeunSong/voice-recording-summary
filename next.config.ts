@@ -6,7 +6,7 @@ const nextConfig: NextConfig = {
       bodySizeLimit: "25mb",
     },
   },
-  serverExternalPackages: ["ffmpeg-static"],
+  serverExternalPackages: ["amr-js"],
 };
 
 export default nextConfig;

@@ -1,10 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
-import { execFileSync } from "child_process";
-import { writeFileSync, readFileSync, unlinkSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
-import { randomUUID } from "crypto";
 
 function getOpenAI() {
   return new OpenAI({
@@ -12,34 +7,23 @@ function getOpenAI() {
   });
 }
 
-// ffmpeg-static 경로를 동적으로 가져옴
-function getFfmpegPath(): string {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  return require("ffmpeg-static") as string;
-}
-
 const MAX_SIZE = 25 * 1024 * 1024; // 25MB
 
-function convertToWav(inputBuffer: Buffer): Buffer {
-  const id = randomUUID();
-  const inputPath = join(tmpdir(), `${id}-input`);
-  const outputPath = join(tmpdir(), `${id}-output.wav`);
+function isAmrFile(buffer: Buffer): boolean {
+  return buffer.length >= 6 && buffer.toString("ascii", 0, 6) === "#!AMR\n";
+}
 
-  try {
-    writeFileSync(inputPath, inputBuffer);
-    execFileSync(getFfmpegPath(), [
-      "-i", inputPath,
-      "-ar", "16000",
-      "-ac", "1",
-      "-f", "wav",
-      "-y",
-      outputPath,
-    ], { timeout: 60000 });
-    return readFileSync(outputPath);
-  } finally {
-    try { unlinkSync(inputPath); } catch { /* ignore */ }
-    try { unlinkSync(outputPath); } catch { /* ignore */ }
+function convertAmrToWav(amrBuffer: Buffer): Buffer {
+  // amr-js/library/amrnb.js: 순수 JS(asm.js) AMR-NB 디코더
+  // AMR.toWAV(Uint8Array) → Uint8Array (WAV 8kHz 16bit mono)
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const AMR = require("amr-js/library/amrnb");
+  const amrData = new Uint8Array(amrBuffer);
+  const wavData: Uint8Array | null = AMR.toWAV(amrData);
+  if (!wavData) {
+    throw new Error("AMR 디코딩 실패");
   }
+  return Buffer.from(wavData);
 }
 
 export async function POST(request: NextRequest) {
@@ -64,31 +48,48 @@ export async function POST(request: NextRequest) {
 
     console.log(`[DEBUG] original name: ${file.name}, type: ${file.type}, size: ${file.size}`);
 
-    // Step 1: ffmpeg로 WAV 변환 (어떤 형식이든 처리 가능)
     const inputBuffer = Buffer.from(await file.arrayBuffer());
-    let wavBuffer: Buffer;
-    try {
-      wavBuffer = convertToWav(inputBuffer);
-    } catch (ffmpegError: unknown) {
-      const errMsg = ffmpegError instanceof Error ? ffmpegError.message : String(ffmpegError);
-      const errStack = ffmpegError instanceof Error ? ffmpegError.stack : undefined;
-      console.error("ffmpeg conversion error:", errMsg, errStack);
-      return NextResponse.json(
-        {
-          error: `오디오 파일을 변환할 수 없습니다.`,
-          debug: {
-            originalName: file.name,
-            type: file.type,
-            size: file.size,
-            ffmpegError: errMsg,
+    const first8hex = inputBuffer.subarray(0, 8).toString("hex");
+    console.log(`[DEBUG] magic bytes: ${first8hex}`);
+
+    let uploadBuffer: Buffer;
+    let uploadName: string;
+    let uploadType: string;
+
+    if (isAmrFile(inputBuffer)) {
+      // AMR → WAV 변환 (순수 JS 디코더, 네이티브 바이너리 불필요)
+      console.log("[DEBUG] AMR detected, converting to WAV...");
+      try {
+        uploadBuffer = convertAmrToWav(inputBuffer);
+        uploadName = "audio.wav";
+        uploadType = "audio/wav";
+        console.log(`[DEBUG] WAV conversion done, size: ${uploadBuffer.length}`);
+      } catch (amrError: unknown) {
+        const msg = amrError instanceof Error ? amrError.message : String(amrError);
+        return NextResponse.json(
+          {
+            error: "AMR 파일 변환 실패",
+            debug: { originalName: file.name, type: file.type, size: file.size, amrError: msg },
           },
-        },
-        { status: 422 }
-      );
+          { status: 422 }
+        );
+      }
+    } else {
+      // 비 AMR 파일: 확장자 기반 MIME 매핑 후 그대로 전달
+      const fileName = file.name.toLowerCase();
+      const ext = fileName.match(/\.(m4a|mp3|aac|wav|ogg|webm|flac|mp4|mpeg|mpga|oga)$/)?.[1] || "m4a";
+      const MIME_MAP: Record<string, string> = {
+        m4a: "audio/mp4", mp3: "audio/mpeg", aac: "audio/aac",
+        wav: "audio/wav", ogg: "audio/ogg", webm: "audio/webm", flac: "audio/flac",
+        mp4: "audio/mp4", mpeg: "audio/mpeg", mpga: "audio/mpeg", oga: "audio/ogg",
+      };
+      uploadBuffer = inputBuffer;
+      uploadName = `audio.${ext}`;
+      uploadType = MIME_MAP[ext] || "audio/mp4";
     }
 
-    // Step 2: Whisper API로 음성 → 텍스트
-    const uploadFile = await toFile(wavBuffer, "audio.wav", { type: "audio/wav" });
+    // Whisper API
+    const uploadFile = await toFile(uploadBuffer, uploadName, { type: uploadType });
     const openai = getOpenAI();
     const transcription = await openai.audio.transcriptions.create({
       file: uploadFile,
@@ -106,7 +107,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Step 3: GPT로 요약 생성
+    // GPT 요약
     const summaryResponse = await openai.chat.completions.create({
       model: "gpt-5.2",
       messages: [
@@ -168,8 +169,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const errMsg = error instanceof Error ? error.message : String(error);
     return NextResponse.json(
-      { error: "처리 중 오류가 발생했습니다. 다시 시도해주세요." },
+      {
+        error: "처리 중 오류가 발생했습니다.",
+        debug: { originalName: file?.name, type: file?.type, size: file?.size, detail: errMsg },
+      },
       { status: 500 }
     );
   }
