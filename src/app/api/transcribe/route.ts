@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
+import OpenAI, { toFile } from "openai";
 
 function getOpenAI() {
   return new OpenAI({
@@ -26,9 +26,10 @@ const ALLOWED_TYPES = [
 const MAX_SIZE = 25 * 1024 * 1024; // 25MB
 
 export async function POST(request: NextRequest) {
+  let file: File | null = null;
   try {
     const formData = await request.formData();
-    const file = formData.get("file") as File | null;
+    file = formData.get("file") as File | null;
 
     if (!file) {
       return NextResponse.json(
@@ -66,15 +67,16 @@ export async function POST(request: NextRequest) {
 
     // Step 1: Whisper API로 음성 → 텍스트
     // 카카오톡 등에서 저장한 파일은 MIME type이나 파일명이 깨질 수 있으므로
-    // 확장자를 추출해서 깨끗한 파일명으로 재생성
+    // Buffer로 변환 후 깨끗한 파일명으로 OpenAI에 전달
     const ext = fileName.match(/\.(m4a|mp3|aac|amr|wav|ogg|webm|flac|mp4|mpeg|mpga|oga)$/)?.[1] || "m4a";
-    const cleanFile = new File([file], `audio.${ext}`, {
-      type: file.type || `audio/${ext}`,
-    });
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const uploadFile = await toFile(buffer, `audio.${ext}`);
+
+    console.log(`[DEBUG] original name: ${file.name}, type: ${file.type}, size: ${file.size}, ext: ${ext}`);
 
     const openai = getOpenAI();
     const transcription = await openai.audio.transcriptions.create({
-      file: cleanFile,
+      file: uploadFile,
       model: "whisper-1",
       language: "ko",
       response_format: "text",
@@ -143,7 +145,10 @@ export async function POST(request: NextRequest) {
         );
       }
       return NextResponse.json(
-        { error: `OpenAI API 오류: ${error.message}` },
+        {
+          error: `OpenAI API 오류: ${error.message}`,
+          debug: { originalName: file?.name, type: file?.type, size: file?.size },
+        },
         { status: 502 }
       );
     }

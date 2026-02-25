@@ -65,7 +65,8 @@ export default function Home() {
 
       if (!response.ok) {
         const data = await response.json();
-        throw new Error(data.error || "처리 중 오류가 발생했습니다.");
+        const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}` : "";
+        throw new Error((data.error || "처리 중 오류가 발생했습니다.") + debugInfo);
       }
 
       setStep("summarizing");
