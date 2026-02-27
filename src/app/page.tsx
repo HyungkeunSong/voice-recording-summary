@@ -1,31 +1,13 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
+import type { Summary, TranscribeResult } from "@/app/types";
 
-interface Summary {
-  briefSummary: string;
-  participants: string;
-  keyPoints: string;
-  agreements: string;
-  legallySignificant: string;
-  cautions: string;
-}
+type Result = TranscribeResult;
 
-interface Result {
-  transcript: string;
-  summary: Summary;
-}
+type ProcessingStep = "idle" | "processing" | "done" | "error";
 
-type ProcessingStep = "idle" | "uploading" | "transcribing" | "summarizing" | "done" | "error";
-
-const STEP_LABELS: Record<ProcessingStep, string> = {
-  idle: "",
-  uploading: "파일 업로드 중...",
-  transcribing: "음성 변환 및 텍스트 추출 중...",
-  summarizing: "내용 분석 및 요약 중...",
-  done: "완료!",
-  error: "오류 발생",
-};
+const STORAGE_KEY = "voice-summary-result";
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -33,7 +15,32 @@ export default function Home() {
   const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState<string>("");
   const [copied, setCopied] = useState<string>("");
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [savedFileName, setSavedFileName] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // localStorage에서 이전 결과 복원
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as { result: Result; fileName: string };
+        setResult(parsed.result);
+        setSavedFileName(parsed.fileName);
+        setStep("done");
+      }
+    } catch { /* corrupt storage */ }
+  }, []);
+
+  // 경과 시간 타이머
+  useEffect(() => {
+    if (step !== "processing") {
+      setElapsedSeconds(0);
+      return;
+    }
+    const interval = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    return () => clearInterval(interval);
+  }, [step]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
@@ -42,6 +49,7 @@ export default function Home() {
       setResult(null);
       setError("");
       setStep("idle");
+      setSavedFileName("");
     }
   };
 
@@ -50,16 +58,15 @@ export default function Home() {
 
     setError("");
     setResult(null);
-    setStep("uploading");
+    setSavedFileName("");
+    setStep("processing");
 
     try {
       const formData = new FormData();
       formData.append("file", file);
 
-      setStep("transcribing");
-
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000); // 2분 타임아웃
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
 
       const response = await fetch("/api/transcribe", {
         method: "POST",
@@ -72,10 +79,7 @@ export default function Home() {
         let errorMsg = "처리 중 오류가 발생했습니다.";
         try {
           const data = await response.json();
-          const extraInfo = data.debug?.ffmpegError ? `\n[ffmpeg] ${data.debug.ffmpegError}` : (data.debug?.amrError ? `\n[amr] ${data.debug.amrError}` : "");
-          const magicInfo = data.debug?.magic ? `\n[magic] ${data.debug.magic}` : "";
-          const debugInfo = data.debug ? `\n[디버그] name: ${data.debug.originalName}, type: ${data.debug.type}, size: ${data.debug.size}${extraInfo}${magicInfo}` : "";
-          errorMsg = (data.error || errorMsg) + debugInfo;
+          errorMsg = data.error || errorMsg;
         } catch {
           if (response.status === 504) {
             errorMsg = "서버 처리 시간이 초과되었습니다. 파일이 너무 길 수 있습니다.";
@@ -86,10 +90,17 @@ export default function Home() {
         throw new Error(errorMsg);
       }
 
-      setStep("summarizing");
       const data: Result = await response.json();
       setResult(data);
       setStep("done");
+
+      // localStorage에 결과 저장
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          result: data,
+          fileName: file.name,
+        }));
+      } catch { /* storage full */ }
     } catch (err: unknown) {
       let message: string;
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -100,6 +111,13 @@ export default function Home() {
       setError(message);
       setStep("error");
     }
+  };
+
+  const clearSavedResult = () => {
+    localStorage.removeItem(STORAGE_KEY);
+    setResult(null);
+    setSavedFileName("");
+    setStep("idle");
   };
 
   const copyToClipboard = async (text: string, label: string) => {
@@ -119,6 +137,49 @@ export default function Home() {
     }
   };
 
+  const formatFullReport = (r: Result): string => {
+    const now = new Date().toLocaleString("ko-KR");
+    return `녹음 요약 리포트
+생성일시: ${now}
+${"=".repeat(40)}
+
+[간단 요약]
+${r.summary.briefSummary}
+
+[통화 상대방]
+${r.summary.participants}
+
+[핵심 내용]
+${r.summary.keyPoints}
+
+[약속/합의 사항]
+${r.summary.agreements}
+
+[법적 중요 발언]
+${r.summary.legallySignificant}
+
+[주의할 점]
+${r.summary.cautions}
+
+${"=".repeat(40)}
+[전체 텍스트]
+${r.transcript}`;
+  };
+
+  const downloadReport = () => {
+    if (!result) return;
+    const content = formatFullReport(result);
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
+    a.href = url;
+    a.download = `녹음요약_${dateStr}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const formatDetailedAnalysis = (summary: Summary): string => {
     return `[통화 상대방]
 ${summary.participants}
@@ -136,12 +197,25 @@ ${summary.legallySignificant}
 ${summary.cautions}`;
   };
 
-  const isProcessing = step === "uploading" || step === "transcribing" || step === "summarizing";
+  const isProcessing = step === "processing";
 
   return (
     <main className="min-h-screen px-4 py-6 max-w-lg mx-auto">
       <h1 className="text-2xl font-bold text-center mb-1">녹음 요약 도구</h1>
       <p className="text-sm text-gray-400 text-center mb-6">삼촌이 깨어나길 기도합니다</p>
+
+      {/* 이전 결과 알림 */}
+      {savedFileName && !isProcessing && (
+        <div className="mb-4 p-3 bg-gray-50 rounded-2xl flex items-center justify-between">
+          <p className="text-sm text-gray-600">이전 결과: {savedFileName}</p>
+          <button
+            onClick={clearSavedResult}
+            className="px-3 py-1.5 text-sm font-medium rounded-lg bg-gray-200 text-gray-600 active:bg-gray-300"
+          >
+            새로 시작
+          </button>
+        </div>
+      )}
 
       {/* 파일 선택 */}
       <div className="mb-4">
@@ -180,7 +254,9 @@ ${summary.cautions}`;
         <div className="mb-6 p-4 bg-blue-50 rounded-2xl">
           <div className="flex items-center gap-3">
             <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-            <span className="text-blue-800 font-medium">{STEP_LABELS[step]}</span>
+            <span className="text-blue-800 font-medium">
+              처리 중... ({elapsedSeconds}초 경과)
+            </span>
           </div>
           <p className="mt-2 text-sm text-blue-600">
             파일 크기에 따라 1~3분 정도 걸릴 수 있습니다.
@@ -192,12 +268,27 @@ ${summary.cautions}`;
       {error && (
         <div className="mb-6 p-4 bg-red-50 rounded-2xl">
           <p className="text-red-700 font-medium whitespace-pre-wrap">{error}</p>
+          {file && (
+            <button
+              onClick={handleSubmit}
+              className="mt-3 w-full py-3 bg-red-600 text-white font-bold rounded-xl active:bg-red-700"
+            >
+              다시 시도
+            </button>
+          )}
         </div>
       )}
 
       {/* 결과 */}
       {result && (
         <div className="space-y-4">
+          {/* 부분 실패 경고 */}
+          {result.partialFailure && (
+            <div className="p-3 bg-yellow-50 rounded-2xl border border-yellow-200">
+              <p className="text-yellow-800 text-sm font-medium">{result.partialFailure}</p>
+            </div>
+          )}
+
           <ResultSection
             title="간단 요약"
             content={result.summary.briefSummary}
@@ -231,6 +322,14 @@ ${summary.cautions}`;
             onCopy={() => copyToClipboard(result.transcript, "transcript")}
             isCopied={copied === "transcript"}
           />
+
+          {/* 전체 리포트 다운로드 */}
+          <button
+            onClick={downloadReport}
+            className="w-full py-4 px-6 bg-green-600 text-white text-lg font-bold rounded-2xl active:bg-green-700"
+          >
+            전체 리포트 다운로드
+          </button>
         </div>
       )}
     </main>
