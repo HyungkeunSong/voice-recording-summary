@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { toFile } from "openai";
 import { prepareAudioForWhisper, splitWavIntoChunks } from "@/app/utils/audioProcessing";
-import { createSummary } from "@/app/utils/summarize";
 
 const isDev = process.env.NODE_ENV === "development";
 
@@ -108,13 +107,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "음성을 인식할 수 없습니다. 녹음 상태를 확인해주세요." }, { status: 422 });
     }
 
-    // 4. GPT 요약 (모델 폴백 체인)
-    const summary = await createSummary(openai, transcript, log);
-
-    // 5. 응답
+    // 4. 응답 (전사만 반환, 요약은 /api/summarize에서 별도 처리)
     return NextResponse.json({
       transcript,
-      summary,
       ...(partialFailure && { partialFailure }),
     });
   } catch (error: unknown) {
@@ -131,11 +126,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const errMsg = error instanceof Error ? error.message : String(error);
     return NextResponse.json(
       {
-        error: errMsg.includes("모든 GPT 모델") ? errMsg : "처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
-        ...(isDev && { debug: { name: file?.name, type: file?.type, size: file?.size, detail: errMsg } }),
+        error: "처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+        ...(isDev && { debug: { name: file?.name, type: file?.type, size: file?.size, detail: error instanceof Error ? error.message : String(error) } }),
       },
       { status: 500 },
     );

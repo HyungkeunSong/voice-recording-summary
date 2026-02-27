@@ -5,7 +5,7 @@ import type { Summary, TranscribeResult } from "@/app/types";
 
 type Result = TranscribeResult;
 
-type ProcessingStep = "idle" | "processing" | "done" | "error";
+type ProcessingStep = "idle" | "transcribing" | "summarizing" | "done" | "error";
 
 const STORAGE_KEY = "voice-summary-result";
 
@@ -34,7 +34,7 @@ export default function Home() {
 
   // 경과 시간 타이머
   useEffect(() => {
-    if (step !== "processing") {
+    if (step !== "transcribing" && step !== "summarizing") {
       setElapsedSeconds(0);
       return;
     }
@@ -59,45 +59,85 @@ export default function Home() {
     setError("");
     setResult(null);
     setSavedFileName("");
-    setStep("processing");
 
     try {
+      // Step 1: 텍스트 추출 (전사)
+      setStep("transcribing");
+
       const formData = new FormData();
       formData.append("file", file);
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000);
+      const transcribeController = new AbortController();
+      const transcribeTimeout = setTimeout(() => transcribeController.abort(), 90000);
 
-      const response = await fetch("/api/transcribe", {
+      const transcribeRes = await fetch("/api/transcribe", {
         method: "POST",
         body: formData,
-        signal: controller.signal,
+        signal: transcribeController.signal,
       });
-      clearTimeout(timeoutId);
+      clearTimeout(transcribeTimeout);
 
-      if (!response.ok) {
-        let errorMsg = "처리 중 오류가 발생했습니다.";
+      if (!transcribeRes.ok) {
+        let errorMsg = "텍스트 추출 중 오류가 발생했습니다.";
         try {
-          const data = await response.json();
+          const data = await transcribeRes.json();
           errorMsg = data.error || errorMsg;
         } catch {
-          if (response.status === 504) {
-            errorMsg = "서버 처리 시간이 초과되었습니다. 파일이 너무 길 수 있습니다.";
+          if (transcribeRes.status === 504) {
+            errorMsg = "텍스트 추출 시간이 초과되었습니다. 파일이 너무 길 수 있습니다.";
           } else {
-            errorMsg = `서버 오류 (${response.status}). 잠시 후 다시 시도해주세요.`;
+            errorMsg = `서버 오류 (${transcribeRes.status}). 잠시 후 다시 시도해주세요.`;
           }
         }
         throw new Error(errorMsg);
       }
 
-      const data: Result = await response.json();
-      setResult(data);
+      const transcribeData = await transcribeRes.json();
+      const { transcript, partialFailure } = transcribeData as {
+        transcript: string;
+        partialFailure?: string;
+      };
+
+      // Step 2: 요약
+      setStep("summarizing");
+
+      const summarizeController = new AbortController();
+      const summarizeTimeout = setTimeout(() => summarizeController.abort(), 90000);
+
+      const summarizeRes = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript }),
+        signal: summarizeController.signal,
+      });
+      clearTimeout(summarizeTimeout);
+
+      if (!summarizeRes.ok) {
+        let errorMsg = "요약 중 오류가 발생했습니다.";
+        try {
+          const data = await summarizeRes.json();
+          errorMsg = data.error || errorMsg;
+        } catch {
+          if (summarizeRes.status === 504) {
+            errorMsg = "요약 시간이 초과되었습니다. 잠시 후 다시 시도해주세요.";
+          } else {
+            errorMsg = `서버 오류 (${summarizeRes.status}). 잠시 후 다시 시도해주세요.`;
+          }
+        }
+        throw new Error(errorMsg);
+      }
+
+      const summarizeData = await summarizeRes.json();
+      const { summary } = summarizeData as { summary: Summary };
+
+      const finalResult: Result = { transcript, summary, partialFailure };
+      setResult(finalResult);
       setStep("done");
 
       // localStorage에 결과 저장
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify({
-          result: data,
+          result: finalResult,
           fileName: file.name,
         }));
       } catch { /* storage full */ }
@@ -197,7 +237,7 @@ ${summary.legallySignificant}
 ${summary.cautions}`;
   };
 
-  const isProcessing = step === "processing";
+  const isProcessing = step === "transcribing" || step === "summarizing";
 
   return (
     <main className="min-h-screen px-4 py-6 max-w-lg mx-auto">
@@ -246,7 +286,7 @@ ${summary.cautions}`;
         disabled={!file || isProcessing}
         className="w-full py-4 px-6 bg-blue-600 text-white text-lg font-bold rounded-2xl active:bg-blue-700 disabled:bg-gray-300 disabled:text-gray-500 mb-6"
       >
-        {isProcessing ? "처리 중..." : "변환 시작"}
+        {step === "transcribing" ? "텍스트 추출 중..." : step === "summarizing" ? "요약 중..." : "변환 시작"}
       </button>
 
       {/* 진행 상태 */}
@@ -255,12 +295,23 @@ ${summary.cautions}`;
           <div className="flex items-center gap-3">
             <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
             <span className="text-blue-800 font-medium">
-              처리 중... ({elapsedSeconds}초 경과)
+              {step === "transcribing" ? "텍스트 추출 중" : "요약 중"}... ({elapsedSeconds}초 경과)
             </span>
           </div>
           <p className="mt-2 text-sm text-blue-600">
-            파일 크기에 따라 1~3분 정도 걸릴 수 있습니다.
+            {step === "transcribing"
+              ? "음성을 텍스트로 변환하고 있습니다. 파일 크기에 따라 1~2분 정도 걸릴 수 있습니다."
+              : "텍스트를 분석하고 요약하고 있습니다."}
           </p>
+          {/* 단계 표시 */}
+          <div className="mt-3 flex gap-2">
+            <div className={`flex-1 h-1.5 rounded-full ${step === "transcribing" ? "bg-blue-400 animate-pulse" : "bg-blue-400"}`} />
+            <div className={`flex-1 h-1.5 rounded-full ${step === "summarizing" ? "bg-blue-400 animate-pulse" : "bg-gray-200"}`} />
+          </div>
+          <div className="mt-1 flex justify-between text-xs text-blue-500">
+            <span>1. 텍스트 추출</span>
+            <span>2. 요약</span>
+          </div>
         </div>
       )}
 
