@@ -92,9 +92,15 @@ export function prepareAudioForWhisper(
     log("MP4/ftyp container detected");
     const is3gp = inputBuffer.toString("ascii", 8, 12).startsWith("3gp");
     if (is3gp) {
-      log("3GP brand detected, extracting AMR from mdat...");
+      log("3GP brand detected, checking codec...");
       try {
         const amrBuffer = extract3gpAmrData(inputBuffer);
+        // mdat payload가 원본의 50% 이상이면 AMR이 아닌 코덱 (AAC 등)
+        // AMR-NB는 4.75~12.2kbps로 매우 작고, AAC는 원본과 비슷한 크기
+        if (amrBuffer.length > inputBuffer.length * 0.5) {
+          log(`mdat too large for AMR (${amrBuffer.length} vs ${inputBuffer.length}), codec is likely AAC — sending as .mp4`);
+          return { buffer: inputBuffer, name: "audio.mp4", type: "audio/mp4" };
+        }
         log(`AMR extracted (${amrBuffer.length} bytes), converting to WAV...`);
         const wavBuffer = convertAmrToWav(amrBuffer);
         log(`WAV conversion done, size: ${wavBuffer.length}`);
