@@ -5,9 +5,64 @@ import type { Summary, TranscribeResult } from "@/app/types";
 
 type Result = TranscribeResult;
 
-type ProcessingStep = "idle" | "transcribing" | "summarizing" | "done" | "error";
+type ProcessingStep = "idle" | "converting" | "transcribing" | "summarizing" | "done" | "error";
 
 const STORAGE_KEY = "voice-summary-result";
+
+/** 브라우저 AudioContext로 오디오 파일을 16kHz mono WAV로 변환 */
+async function convertToWav(file: File): Promise<Blob> {
+  const arrayBuffer = await file.arrayBuffer();
+  const audioCtx = new AudioContext({ sampleRate: 16000 });
+  const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+  audioCtx.close();
+
+  // mono로 다운믹스
+  const length = decoded.length;
+  const mono = new Float32Array(length);
+  const numChannels = decoded.numberOfChannels;
+  for (let ch = 0; ch < numChannels; ch++) {
+    const channelData = decoded.getChannelData(ch);
+    for (let i = 0; i < length; i++) {
+      mono[i] += channelData[i] / numChannels;
+    }
+  }
+
+  // Float32 → Int16
+  const pcm = new Int16Array(length);
+  for (let i = 0; i < length; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+
+  // WAV 헤더 생성
+  const wavBuffer = new ArrayBuffer(44 + pcm.length * 2);
+  const view = new DataView(wavBuffer);
+  const sampleRate = 16000;
+  const byteRate = sampleRate * 2;
+  const dataSize = pcm.length * 2;
+
+  // RIFF header
+  view.setUint32(0, 0x52494646, false); // "RIFF"
+  view.setUint32(4, 36 + dataSize, true);
+  view.setUint32(8, 0x57415645, false); // "WAVE"
+  // fmt chunk
+  view.setUint32(12, 0x666D7420, false); // "fmt "
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  // data chunk
+  view.setUint32(36, 0x64617461, false); // "data"
+  view.setUint32(40, dataSize, true);
+
+  const wavBytes = new Uint8Array(wavBuffer);
+  wavBytes.set(new Uint8Array(pcm.buffer), 44);
+
+  return new Blob([wavBytes], { type: "audio/wav" });
+}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -34,7 +89,7 @@ export default function Home() {
 
   // 경과 시간 타이머
   useEffect(() => {
-    if (step !== "transcribing" && step !== "summarizing") {
+    if (step !== "converting" && step !== "transcribing" && step !== "summarizing") {
       setElapsedSeconds(0);
       return;
     }
@@ -61,11 +116,21 @@ export default function Home() {
     setSavedFileName("");
 
     try {
-      // Step 1: 텍스트 추출 (전사)
+      // Step 1: 브라우저에서 WAV 변환
+      setStep("converting");
+
+      let wavBlob: Blob;
+      try {
+        wavBlob = await convertToWav(file);
+      } catch {
+        throw new Error("이 파일 형식을 변환할 수 없습니다. 다른 녹음 파일을 시도해주세요.");
+      }
+
+      // Step 2: 서버에 WAV 전송 → Whisper 전사
       setStep("transcribing");
 
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("file", new File([wavBlob], "audio.wav", { type: "audio/wav" }));
 
       const transcribeController = new AbortController();
       const transcribeTimeout = setTimeout(() => transcribeController.abort(), 90000);
@@ -98,7 +163,7 @@ export default function Home() {
         partialFailure?: string;
       };
 
-      // Step 2: 요약
+      // Step 3: 요약
       setStep("summarizing");
 
       const summarizeController = new AbortController();
@@ -237,7 +302,13 @@ ${summary.legallySignificant}
 ${summary.cautions}`;
   };
 
-  const isProcessing = step === "transcribing" || step === "summarizing";
+  const isProcessing = step === "converting" || step === "transcribing" || step === "summarizing";
+
+  const stepLabel = step === "converting" ? "파일 변환 중"
+    : step === "transcribing" ? "텍스트 추출 중"
+    : step === "summarizing" ? "요약 중" : "";
+
+  const stepIndex = step === "converting" ? 0 : step === "transcribing" ? 1 : step === "summarizing" ? 2 : -1;
 
   return (
     <main className="min-h-screen px-4 py-6 max-w-lg mx-auto">
@@ -247,10 +318,10 @@ ${summary.cautions}`;
       {/* 이전 결과 알림 */}
       {savedFileName && !isProcessing && (
         <div className="mb-4 p-3 bg-gray-50 rounded-2xl flex items-center justify-between">
-          <p className="text-sm text-gray-600">이전 결과: {savedFileName}</p>
+          <p className="text-sm text-gray-600 truncate mr-2">이전 결과: {savedFileName}</p>
           <button
             onClick={clearSavedResult}
-            className="px-3 py-1.5 text-sm font-medium rounded-lg bg-gray-200 text-gray-600 active:bg-gray-300"
+            className="px-3 py-1.5 text-sm font-medium rounded-lg bg-gray-200 text-gray-600 active:bg-gray-300 shrink-0"
           >
             새로 시작
           </button>
@@ -266,28 +337,37 @@ ${summary.cautions}`;
           onChange={handleFileChange}
           className="hidden"
         />
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          disabled={isProcessing}
-          className="w-full py-4 px-6 bg-white border-2 border-dashed border-gray-300 rounded-2xl text-lg font-medium text-gray-600 active:bg-gray-100 disabled:opacity-50"
-        >
-          {file ? `${file.name}` : "녹음 파일 선택"}
-        </button>
-        {file && (
-          <p className="mt-2 text-sm text-gray-500 text-center">
-            {(file.size / (1024 * 1024)).toFixed(1)}MB
+        {isProcessing ? (
+          <p className="text-sm text-gray-500 text-center truncate px-2">
+            {file?.name} ({(file!.size / (1024 * 1024)).toFixed(1)}MB)
           </p>
+        ) : (
+          <>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="w-full py-4 px-6 bg-white border-2 border-dashed border-gray-300 rounded-2xl text-lg font-medium text-gray-600 active:bg-gray-100 truncate"
+            >
+              {file ? file.name : "녹음 파일 선택"}
+            </button>
+            {file && (
+              <p className="mt-2 text-sm text-gray-500 text-center">
+                {(file.size / (1024 * 1024)).toFixed(1)}MB
+              </p>
+            )}
+          </>
         )}
       </div>
 
-      {/* 변환 버튼 */}
-      <button
-        onClick={handleSubmit}
-        disabled={!file || isProcessing}
-        className="w-full py-4 px-6 bg-blue-600 text-white text-lg font-bold rounded-2xl active:bg-blue-700 disabled:bg-gray-300 disabled:text-gray-500 mb-6"
-      >
-        {step === "transcribing" ? "텍스트 추출 중..." : step === "summarizing" ? "요약 중..." : "변환 시작"}
-      </button>
+      {/* 변환 버튼 — 처리 중에는 숨김 */}
+      {!isProcessing && (
+        <button
+          onClick={handleSubmit}
+          disabled={!file}
+          className="w-full py-4 px-6 bg-blue-600 text-white text-lg font-bold rounded-2xl active:bg-blue-700 disabled:bg-gray-300 disabled:text-gray-500 mb-6"
+        >
+          변환 시작
+        </button>
+      )}
 
       {/* 진행 상태 */}
       {isProcessing && (
@@ -295,22 +375,24 @@ ${summary.cautions}`;
           <div className="flex items-center gap-3">
             <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
             <span className="text-blue-800 font-medium">
-              {step === "transcribing" ? "텍스트 추출 중" : "요약 중"}... ({elapsedSeconds}초 경과)
+              {stepLabel}... ({elapsedSeconds}초 경과)
             </span>
           </div>
           <p className="mt-2 text-sm text-blue-600">
-            {step === "transcribing"
-              ? "음성을 텍스트로 변환하고 있습니다. 파일 크기에 따라 1~2분 정도 걸릴 수 있습니다."
+            {step === "converting"
+              ? "브라우저에서 오디오 파일을 변환하고 있습니다."
+              : step === "transcribing"
+              ? "음성을 텍스트로 변환하고 있습니다."
               : "텍스트를 분석하고 요약하고 있습니다."}
           </p>
-          {/* 단계 표시 */}
-          <div className="mt-3 flex gap-2">
-            <div className={`flex-1 h-1.5 rounded-full ${step === "transcribing" ? "bg-blue-400 animate-pulse" : "bg-blue-400"}`} />
-            <div className={`flex-1 h-1.5 rounded-full ${step === "summarizing" ? "bg-blue-400 animate-pulse" : "bg-gray-200"}`} />
-          </div>
-          <div className="mt-1 flex justify-between text-xs text-blue-500">
-            <span>1. 텍스트 추출</span>
-            <span>2. 요약</span>
+          {/* 3단계 진행바 */}
+          <div className="mt-3 flex gap-1.5">
+            {["변환", "추출", "요약"].map((label, i) => (
+              <div key={label} className="flex-1">
+                <div className={`h-1.5 rounded-full ${i <= stepIndex ? (i === stepIndex ? "bg-blue-400 animate-pulse" : "bg-blue-400") : "bg-gray-200"}`} />
+                <p className="mt-1 text-xs text-blue-500 text-center">{label}</p>
+              </div>
+            ))}
           </div>
         </div>
       )}
