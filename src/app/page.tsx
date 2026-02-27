@@ -9,59 +9,58 @@ type ProcessingStep = "idle" | "converting" | "transcribing" | "summarizing" | "
 
 const STORAGE_KEY = "voice-summary-result";
 
-/** 브라우저 AudioContext로 오디오 파일을 16kHz mono WAV로 변환 */
+/** 브라우저에서 오디오 파일을 16kHz mono WAV로 변환 (OfflineAudioContext로 확실한 리샘플링) */
 async function convertToWav(file: File): Promise<Blob> {
   const arrayBuffer = await file.arrayBuffer();
-  const audioCtx = new AudioContext({ sampleRate: 16000 });
-  const decoded = await audioCtx.decodeAudioData(arrayBuffer);
-  audioCtx.close();
 
-  // mono로 다운믹스
-  const length = decoded.length;
-  const mono = new Float32Array(length);
-  const numChannels = decoded.numberOfChannels;
-  for (let ch = 0; ch < numChannels; ch++) {
-    const channelData = decoded.getChannelData(ch);
-    for (let i = 0; i < length; i++) {
-      mono[i] += channelData[i] / numChannels;
-    }
-  }
+  // 1) 원본 샘플레이트로 디코딩
+  const tempCtx = new AudioContext();
+  const decoded = await tempCtx.decodeAudioData(arrayBuffer);
+  tempCtx.close();
 
-  // Float32 → Int16
-  const pcm = new Int16Array(length);
-  for (let i = 0; i < length; i++) {
+  // 2) OfflineAudioContext로 16kHz mono 리샘플링
+  const TARGET_RATE = 16000;
+  const duration = decoded.duration;
+  const offlineLength = Math.ceil(duration * TARGET_RATE);
+  const offline = new OfflineAudioContext(1, offlineLength, TARGET_RATE);
+
+  const source = offline.createBufferSource();
+  source.buffer = decoded;
+  source.connect(offline.destination);
+  source.start(0);
+
+  const rendered = await offline.startRendering();
+  const mono = rendered.getChannelData(0);
+
+  // 3) Float32 → Int16
+  const pcm = new Int16Array(mono.length);
+  for (let i = 0; i < mono.length; i++) {
     const s = Math.max(-1, Math.min(1, mono[i]));
     pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
 
-  // WAV 헤더 생성
-  const wavBuffer = new ArrayBuffer(44 + pcm.length * 2);
-  const view = new DataView(wavBuffer);
-  const sampleRate = 16000;
-  const byteRate = sampleRate * 2;
+  // 4) WAV 헤더 + PCM 데이터
   const dataSize = pcm.length * 2;
+  const wavBuffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(wavBuffer);
 
-  // RIFF header
   view.setUint32(0, 0x52494646, false); // "RIFF"
   view.setUint32(4, 36 + dataSize, true);
   view.setUint32(8, 0x57415645, false); // "WAVE"
-  // fmt chunk
   view.setUint32(12, 0x666D7420, false); // "fmt "
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true); // PCM
   view.setUint16(22, 1, true); // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, 2, true); // block align
-  view.setUint16(34, 16, true); // bits per sample
-  // data chunk
+  view.setUint32(24, TARGET_RATE, true);
+  view.setUint32(28, TARGET_RATE * 2, true); // byteRate
+  view.setUint16(32, 2, true); // blockAlign
+  view.setUint16(34, 16, true); // bitsPerSample
   view.setUint32(36, 0x64617461, false); // "data"
   view.setUint32(40, dataSize, true);
 
-  const wavBytes = new Uint8Array(wavBuffer);
-  wavBytes.set(new Uint8Array(pcm.buffer), 44);
+  new Uint8Array(wavBuffer).set(new Uint8Array(pcm.buffer), 44);
 
-  return new Blob([wavBytes], { type: "audio/wav" });
+  return new Blob([wavBuffer], { type: "audio/wav" });
 }
 
 export default function Home() {
