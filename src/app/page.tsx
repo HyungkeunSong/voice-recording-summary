@@ -495,7 +495,7 @@ function ResultSection({
         <h2 className="text-lg font-bold">{title}</h2>
         <CopyButton onClick={onCopy} isCopied={isCopied} />
       </div>
-      <p className="text-gray-700 whitespace-pre-wrap leading-relaxed">{content}</p>
+      <p className="text-[15px] text-gray-700 whitespace-pre-wrap leading-loose">{content}</p>
     </div>
   );
 }
@@ -514,7 +514,7 @@ function DetailItem({
       <h3 className={`text-sm font-bold mb-1 ${highlight ? "text-yellow-800" : "text-gray-500"}`}>
         {label}
       </h3>
-      <p className={`whitespace-pre-wrap leading-relaxed ${highlight ? "text-yellow-900" : "text-gray-700"}`}>
+      <p className={`text-[15px] whitespace-pre-wrap leading-loose ${highlight ? "text-yellow-900" : "text-gray-700"}`}>
         {content}
       </p>
     </div>
