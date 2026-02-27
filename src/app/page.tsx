@@ -9,7 +9,7 @@ type ProcessingStep = "idle" | "converting" | "transcribing" | "summarizing" | "
 
 const STORAGE_KEY = "voice-summary-result";
 
-/** 브라우저에서 오디오 파일을 16kHz mono WAV로 변환 (OfflineAudioContext로 확실한 리샘플링) */
+/** 브라우저에서 오디오 파일을 8kHz mono WAV로 변환 (Vercel 4.5MB body limit 대응) */
 async function convertToWav(file: File): Promise<Blob> {
   const arrayBuffer = await file.arrayBuffer();
 
@@ -18,8 +18,10 @@ async function convertToWav(file: File): Promise<Blob> {
   const decoded = await tempCtx.decodeAudioData(arrayBuffer);
   tempCtx.close();
 
-  // 2) OfflineAudioContext로 16kHz mono 리샘플링
-  const TARGET_RATE = 16000;
+  // 2) OfflineAudioContext로 8kHz mono 리샘플링
+  //    Whisper는 내부적으로 16kHz로 리샘플링하므로 8kHz 입력도 문제없음
+  //    3분 30초 기준: 8000 * 210 * 2 = 3.36MB (Vercel 4.5MB 제한 이내)
+  const TARGET_RATE = 8000;
   const duration = decoded.duration;
   const offlineLength = Math.ceil(duration * TARGET_RATE);
   const offline = new OfflineAudioContext(1, offlineLength, TARGET_RATE);
@@ -123,6 +125,14 @@ export default function Home() {
         wavBlob = await convertToWav(file);
       } catch {
         throw new Error("이 파일 형식을 변환할 수 없습니다. 다른 녹음 파일을 시도해주세요.");
+      }
+
+      // Vercel serverless 함수 body 제한 4.5MB 체크
+      if (wavBlob.size > 4 * 1024 * 1024) {
+        throw new Error(
+          `변환된 파일이 너무 큽니다 (${(wavBlob.size / (1024 * 1024)).toFixed(1)}MB). ` +
+          `10분 이하의 녹음 파일을 사용해주세요.`
+        );
       }
 
       // Step 2: 서버에 WAV 전송 → Whisper 전사
