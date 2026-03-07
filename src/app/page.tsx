@@ -9,6 +9,58 @@ type ProcessingStep = "idle" | "converting" | "transcribing" | "summarizing" | "
 
 const STORAGE_KEY = "voice-summary-result";
 
+/**
+ * WAV ArrayBuffer를 maxBytes 이하의 청크 Blob[]으로 분할.
+ * 각 청크는 독립된 유효한 WAV 파일 (44바이트 헤더 + PCM 슬라이스).
+ */
+function splitWavBuffer(wavBuffer: ArrayBuffer, maxBytes: number): Blob[] {
+  const view = new DataView(wavBuffer);
+  const sampleRate = view.getUint32(24, true);
+  const channels = view.getUint16(22, true);
+  const bitsPerSample = view.getUint16(34, true);
+  const byteRate = sampleRate * channels * (bitsPerSample / 8);
+
+  const HEADER_SIZE = 44;
+  const pcmData = new Uint8Array(wavBuffer, HEADER_SIZE);
+  const blockAlign = channels * (bitsPerSample / 8); // 2 for 16-bit mono
+
+  // 청크당 최대 PCM 바이트 (2바이트 배수 = sample 경계 보장)
+  const maxPcmBytes = Math.floor((maxBytes - HEADER_SIZE) / blockAlign) * blockAlign;
+
+  const chunks: Blob[] = [];
+  let offset = 0;
+
+  while (offset < pcmData.length) {
+    const sliceLen = Math.min(maxPcmBytes, pcmData.length - offset);
+    const pcmSlice = pcmData.slice(offset, offset + sliceLen);
+
+    // 새 WAV 헤더 생성
+    const chunkBuffer = new ArrayBuffer(HEADER_SIZE + sliceLen);
+    const chunkView = new DataView(chunkBuffer);
+
+    chunkView.setUint32(0, 0x52494646, false);          // "RIFF"
+    chunkView.setUint32(4, 36 + sliceLen, true);         // file size - 8
+    chunkView.setUint32(8, 0x57415645, false);           // "WAVE"
+    chunkView.setUint32(12, 0x666D7420, false);          // "fmt "
+    chunkView.setUint32(16, 16, true);                   // chunk size
+    chunkView.setUint16(20, 1, true);                    // PCM
+    chunkView.setUint16(22, channels, true);
+    chunkView.setUint32(24, sampleRate, true);
+    chunkView.setUint32(28, byteRate, true);
+    chunkView.setUint16(32, blockAlign, true);
+    chunkView.setUint16(34, bitsPerSample, true);
+    chunkView.setUint32(36, 0x64617461, false);          // "data"
+    chunkView.setUint32(40, sliceLen, true);
+
+    new Uint8Array(chunkBuffer).set(pcmSlice, HEADER_SIZE);
+
+    chunks.push(new Blob([chunkBuffer], { type: "audio/wav" }));
+    offset += sliceLen;
+  }
+
+  return chunks;
+}
+
 /** 브라우저에서 오디오 파일을 8kHz mono WAV로 변환 (Vercel 4.5MB body limit 대응) */
 async function convertToWav(file: File): Promise<Blob> {
   const arrayBuffer = await file.arrayBuffer();
@@ -73,6 +125,7 @@ export default function Home() {
   const [copied, setCopied] = useState<string>("");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [savedFileName, setSavedFileName] = useState<string>("");
+  const [chunkProgress, setChunkProgress] = useState<{ current: number; total: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // localStorage에서 이전 결과 복원
@@ -115,62 +168,70 @@ export default function Home() {
     setError("");
     setResult(null);
     setSavedFileName("");
+    setChunkProgress(null);
 
     try {
       // Step 1: 브라우저에서 WAV 변환
       setStep("converting");
 
-      let wavBlob: Blob;
+      let wavBuffer: ArrayBuffer;
       try {
-        wavBlob = await convertToWav(file);
+        const wavBlob = await convertToWav(file);
+        wavBuffer = await wavBlob.arrayBuffer();
       } catch {
         throw new Error("이 파일 형식을 변환할 수 없습니다. 다른 녹음 파일을 시도해주세요.");
       }
 
-      // Vercel serverless 함수 body 제한 4.5MB 체크
-      if (wavBlob.size > 4 * 1024 * 1024) {
-        throw new Error(
-          `변환된 파일이 너무 큽니다 (${(wavBlob.size / (1024 * 1024)).toFixed(1)}MB). ` +
-          `10분 이하의 녹음 파일을 사용해주세요.`
-        );
-      }
-
-      // Step 2: 서버에 WAV 전송 → Whisper 전사
+      // Step 2: WAV를 3.5MB 이하 청크로 분할 → 순차 전사
       setStep("transcribing");
 
-      const formData = new FormData();
-      formData.append("file", new File([wavBlob], "audio.wav", { type: "audio/wav" }));
+      const CHUNK_MAX = 3.5 * 1024 * 1024; // 3.5MB
+      const chunks = splitWavBuffer(wavBuffer, CHUNK_MAX);
+      const totalChunks = chunks.length;
 
-      const transcribeController = new AbortController();
-      const transcribeTimeout = setTimeout(() => transcribeController.abort(), 90000);
+      setChunkProgress({ current: 0, total: totalChunks });
 
-      const transcribeRes = await fetch("/api/transcribe", {
-        method: "POST",
-        body: formData,
-        signal: transcribeController.signal,
-      });
-      clearTimeout(transcribeTimeout);
+      const transcripts: string[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        setChunkProgress({ current: i + 1, total: totalChunks });
 
-      if (!transcribeRes.ok) {
-        let errorMsg = "텍스트 추출 중 오류가 발생했습니다.";
-        try {
-          const data = await transcribeRes.json();
-          errorMsg = data.error || errorMsg;
-        } catch {
-          if (transcribeRes.status === 504) {
-            errorMsg = "텍스트 추출 시간이 초과되었습니다. 파일이 너무 길 수 있습니다.";
-          } else {
-            errorMsg = `서버 오류 (${transcribeRes.status}). 잠시 후 다시 시도해주세요.`;
+        const formData = new FormData();
+        formData.append("file", new File([chunks[i]], "audio.wav", { type: "audio/wav" }));
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 90000);
+
+        const res = await fetch("/api/transcribe", {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (!res.ok) {
+          let errorMsg = `텍스트 추출 중 오류가 발생했습니다. (청크 ${i + 1}/${totalChunks})`;
+          try {
+            const data = await res.json();
+            errorMsg = data.error || errorMsg;
+          } catch {
+            if (res.status === 504) {
+              errorMsg = "텍스트 추출 시간이 초과되었습니다.";
+            } else {
+              errorMsg = `서버 오류 (${res.status}). 잠시 후 다시 시도해주세요.`;
+            }
           }
+          throw new Error(errorMsg);
         }
-        throw new Error(errorMsg);
+
+        const data = await res.json() as { transcript: string; partialFailure?: string };
+        const text = data.transcript?.trim() ?? "";
+        if (text.length > 0) transcripts.push(text);
       }
 
-      const transcribeData = await transcribeRes.json();
-      const { transcript, partialFailure } = transcribeData as {
-        transcript: string;
-        partialFailure?: string;
-      };
+      setChunkProgress(null);
+
+      const transcript = transcripts.join(" ");
+      const partialFailure = undefined; // 청크별 처리로 부분 실패 없음
 
       // Step 3: 요약
       setStep("summarizing");
@@ -384,7 +445,10 @@ ${summary.cautions}`;
           <div className="flex items-center gap-3">
             <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
             <span className="text-blue-800 font-medium">
-              {stepLabel}... ({elapsedSeconds}초 경과)
+              {stepLabel}...
+              {step === "transcribing" && chunkProgress && chunkProgress.total > 1
+                ? ` (${chunkProgress.current}/${chunkProgress.total} 청크)`
+                : ` (${elapsedSeconds}초 경과)`}
             </span>
           </div>
           <p className="mt-2 text-sm text-blue-600">
