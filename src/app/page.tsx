@@ -383,7 +383,7 @@ ${summary.cautions}`;
   return (
     <main className="min-h-screen px-4 py-6 max-w-lg mx-auto">
       <h1 className="text-2xl font-bold text-center mb-1">녹음 요약 도구</h1>
-      <p className="text-sm text-gray-400 text-center mb-6">삼촌이 깨어나길 기도합니다</p>
+      <p className="text-sm text-gray-400 text-center mb-6">삼촌의 명복을 빕니다</p>
 
       {/* 이전 결과 알림 */}
       {savedFileName && !isProcessing && (
